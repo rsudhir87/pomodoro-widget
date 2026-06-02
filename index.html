@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pomodoro Widget</title>
+  <style>
+    :root {
+      --bg: #0f172a;        /* slate-900 */
+      --panel: #111827;     /* gray-900 */
+      --text: #e5e7eb;      /* gray-200 */
+      --muted: #9ca3af;     /* gray-400 */
+      --accent: #22c55e;    /* green-500 */
+      --accent-2: #3b82f6;  /* blue-500 */
+      --warn: #f59e0b;      /* amber-500 */
+      --danger: #ef4444;    /* red-500 */
+    }
+    * { box-sizing: border-box; }
+    body {
+      background: var(--bg); color: var(--text);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      margin: 0; display: grid; place-items: center; min-height: 100vh;
+    }
+    .wrap {
+      width: min(560px, 94vw);
+      background: var(--panel); border-radius: 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      padding: 18px;
+    }
+    h1 { font-size: 1.05rem; margin: 0 0 8px; opacity: 0.85; text-align: center; }
+    .time { font-size: 4rem; font-weight: 700; text-align: center; letter-spacing: 1.5px; }
+    .status { text-align: center; margin: 6px 0 12px; color: var(--muted); }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin: 12px 0; }
+    button, select, input[type="number"] {
+      border: none; border-radius: 12px; padding: 10px 14px;
+      color: white; background: #374151; cursor: pointer; font-weight: 600;
+    }
+    button.primary { background: var(--accent); }
+    button.secondary { background: var(--accent-2); }
+    button.warn { background: var(--warn); color: #111827; }
+    button.danger { background: var(--danger); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    label { color: var(--muted); font-size: .9rem; display: inline-flex; align-items: center; gap: 6px; }
+    .cfg { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 6px; }
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 10px; }
+    .dot { height: 10px; border-radius: 6px; background: #374151; opacity: .75; }
+    .dot.on { background: var(--accent); opacity: 1; }
+    .toggles { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin-top: 8px; }
+    .note { text-align: center; font-size: .85rem; opacity: .6; margin-top: 10px; }
+    a { color: var(--text); opacity: .75; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Pomodoro</h1>
+    <div id="time" class="time">25:00</div>
+    <div id="status" class="status">Focus</div>
+
+    <div class="row">
+      <button id="start" class="primary">Start</button>
+      <button id="pause" class="warn" disabled>Pause</button>
+      <button id="reset" class="danger">Reset</button>
+      <button id="skip" class="secondary">Skip</button>
+    </div>
+
+    <div class="cfg">
+      <label>Focus <input id="focusMin" type="number" min="1" max="180" value="25"> min</label>
+      <label>Break <input id="breakMin" type="number" min="1" max="60" value="5"> min</label>
+      <label>Long <input id="longMin" type="number" min="1" max="60" value="15"> min</label>
+      <label>Long after <input id="cyclesNum" type="number" min="1" max="10" value="4"> cycles</label>
+    </div>
+
+    <div class="grid" id="cycles">
+      <div class="dot"></div><div class="dot"></div><div class="dot"></div><div class="dot"></div>
+    </div>
+
+    <div class="toggles">
+      <label><input id="soundToggle" type="checkbox" checked> Sound</label>
+      <label><input id="notifyToggle" type="checkbox"> Desktop notification</label>
+      <label><input id="autostartToggle" type="checkbox" checked> Auto-continue</label>
+      <label><input id="wakelockToggle" type="checkbox"> Keep screen awake</label>
+    </div>
+
+    <div class="note">
+      Settings persist • URL params: <code>?focus=25&break=5&long=15&cycles=4&autostart=1</code>
+    </div>
+  </div>
+
+  <script>
+    // ---- DOM ----
+    const timeEl = document.getElementById('time');
+    const statusEl = document.getElementById('status');
+    const startBtn = document.getElementById('start');
+    const pauseBtn = document.getElementById('pause');
+    const resetBtn = document.getElementById('reset');
+    const skipBtn = document.getElementById('skip');
+    const focusMin = document.getElementById('focusMin');
+    const breakMin = document.getElementById('breakMin');
+    const longMin = document.getElementById('longMin');
+    const cyclesNum = document.getElementById('cyclesNum');
+    const dots = [...document.querySelectorAll('#cycles .dot')];
+    const soundToggle = document.getElementById('soundToggle');
+    const notifyToggle = document.getElementById('notifyToggle');
+    const autostartToggle = document.getElementById('autostartToggle');
+    const wakelockToggle = document.getElementById('wakelockToggle');
+
+    // ---- State ----
+    let mode = 'focus';           // 'focus' | 'break' | 'long'
+    let total = 25 * 60;          // seconds
+    let left = total;
+    let timer = null;
+    let startTs = null;           // for drift compensation
+    let completedFocus = 0;
+    let wakeLock = null;
+
+    // ---- Utils ----
+    const fmt = (n) => {
+      const m = Math.floor(n / 60), s = n % 60;
+      return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    };
+    const clamp = (n, min, max) => Math.min(Math.max(n, min), max);
+
+    function loadPrefs(){
+      const p = JSON.parse(localStorage.getItem('pomo:prefs') || '{}');
+      if (p.focus) focusMin.value = p.focus;
+      if (p.break) breakMin.value = p.break;
+      if (p.long)  longMin.value  = p.long;
+      if (p.cycles) cyclesNum.value = p.cycles;
+      if (p.sound !== undefined) soundToggle.checked = !!p.sound;
+      if (p.notify !== undefined) notifyToggle.checked = !!p.notify;
+      if (p.autostart !== undefined) autostartToggle.checked = !!p.autostart;
+      if (p.wakelock !== undefined) wakelockToggle.checked = !!p.wakelock;
+    }
+    function savePrefs(){
+      const p = {
+        focus: clamp(Number(focusMin.value), 1, 180),
+        break: clamp(Number(breakMin.value), 1, 60),
+        long:  clamp(Number(longMin.value), 1, 60),
+        cycles: clamp(Number(cyclesNum.value), 1, 10),
+        sound: soundToggle.checked,
+        notify: notifyToggle.checked,
+        autostart: autostartToggle.checked,
+        wakelock: wakelockToggle.checked
+      };
+      localStorage.setItem('pomo:prefs', JSON.stringify(p));
+    }
+    function applyURLParams(){
+      const params = new URLSearchParams(location.search);
+      if (params.has('focus')) focusMin.value = params.get('focus');
+      if (params.has('break')) breakMin.value = params.get('break');
+      if (params.has('long'))  longMin.value  = params.get('long');
+      if (params.has('cycles')) cyclesNum.value = params.get('cycles');
+      if (params.get('autostart') === '1') autostartToggle.checked = true;
+    }
+
+    // ---- Audio (WebAudio beep) ----
+    function beep(freq = 880, durMs = 250){
+      if (!soundToggle.checked) return;
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        gain.gain.value = 0.05;
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.start();
+        setTimeout(()=>{ osc.stop(); ctx.close(); }, durMs);
+      } catch(e){}
+    }
+
+    // ---- Notifications ----
+    async function ensureNotify(){
+      if (!notifyToggle.checked) return false;
+      if (!('Notification' in window)) return false;
+      if (Notification.permission === 'granted') return true;
+      const res = await Notification.requestPermission();
+      return res === 'granted';
+    }
+    function notify(title, body){
+      if (!notifyToggle.checked || !('Notification' in window) || Notification.permission !== 'granted') return;
+      try { new Notification(title, { body }); } catch(e){}
+    }
+
+    // ---- Wake Lock (keep screen on) ----
+    async function requestWakeLock(){
+      if (!wakelockToggle.checked || !('wakeLock' in navigator)) return;
+      try { wakeLock = await navigator.wakeLock.request('screen'); }
+      catch(e){ wakeLock = null; }
+    }
+    function releaseWakeLock(){
+      try { if (wakeLock) { wakeLock.release(); wakeLock = null; } } catch(e){}
+    }
+
+    // ---- Mode / timer ----
+    function setMode(next){
+      mode = next;
+      const f = clamp(Number(focusMin.value), 1, 180);
+      const b = clamp(Number(breakMin.value), 1, 60);
+      const l = clamp(Number(longMin.value), 1, 60);
+      if (mode === 'focus') total = f * 60;
+      else if (mode === 'break') total = b * 60;
+      else total = l * 60;
+      left = total;
+      statusEl.textContent = mode === 'focus' ? 'Focus' : (mode==='break' ? 'Break' : 'Long break');
+      timeEl.textContent = fmt(left);
+      savePrefs();
+    }
+    function updateDots(){
+      const cycles = clamp(Number(cyclesNum.value), 1, 10);
+      dots.forEach((d,i)=>{ d.classList.toggle('on', i < (completedFocus % cycles)); });
+    }
+    function start(){
+      startBtn.disabled = true; pauseBtn.disabled = false;
+      startTs = performance.now();
+      timer = setInterval(tick, 250); // 250ms for smoother countdown/less drift
+      requestWakeLock();
+    }
+    function pause(){
+      startBtn.disabled = false; pauseBtn.disabled = true;
+      clearInterval(timer); timer = null;
+      releaseWakeLock();
+    }
+    function reset(){
+      pause();
+      completedFocus = 0; updateDots();
+      setMode('focus');
+    }
+    function skip(){ left = 0; tick(); }
+
+    function tick(){
+      // drift compensation: compute elapsed since start
+      const elapsedSec = Math.floor((performance.now() - startTs) / 1000);
+      left = Math.max(0, total - elapsedSec);
+      timeEl.textContent = fmt(left);
+      if (left === 0){
+        // transition
+        pause();
+        beep(880, 200); beep(660, 200);
+        ensureNotify().then(ok=>{
+          const label = mode === 'focus' ? 'Focus complete' : (mode==='break' ? 'Break over' : 'Long break over');
+          notify(label, 'Starting next block…');
+        });
+        if (mode === 'focus'){
+          completedFocus++;
+          updateDots();
+          const cycles = clamp(Number(cyclesNum.value), 1, 10);
+          if (completedFocus % cycles === 0){ setMode('long'); }
+          else { setMode('break'); }
+        } else {
+          setMode('focus');
+        }
+        if (autostartToggle.checked){ start(); }
+      }
+    }
+
+    // ---- Events ----
+    focusMin.onchange = breakMin.onchange = longMin.onchange = cyclesNum.onchange = savePrefs;
+    soundToggle.onchange = notifyToggle.onchange = autostartToggle.onchange = wakelockToggle.onchange = savePrefs;
+    startBtn.onclick = start;
+    pauseBtn.onclick = pause;
+    resetBtn.onclick = reset;
+    skipBtn.onclick = skip;
+
+    // ---- Init ----
+    loadPrefs(); applyURLParams();
+    setMode('focus'); updateDots();
+  </script>
+</body>
+</html>
